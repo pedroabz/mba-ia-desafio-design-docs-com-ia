@@ -1,60 +1,64 @@
-# ADR-001: Usar Transactional Outbox no MySQL para entrega de eventos de webhook
+# ADR-001: Padrão Outbox no MySQL existente
 
-## Status
+**Status:** Aceita
+**Data:** 2026-07-05
+**Decisores:** Diego (Engenheiro Sênior), Bruno (Engenheiro Pleno), Larissa (Tech Lead)
 
-Aceita
+---
 
 ## Contexto
 
-O método `changeStatus` em `src/modules/orders/order.service.ts` já executa uma transação SQL pesada via `this.prisma.$transaction()`, que atualiza pedidos, insere registros em `order_status_history` e decrementa estoque. A funcionalidade de webhooks exige notificar sistemas externos quando o status de um pedido muda.
+O sistema de gestão de pedidos precisa notificar clientes B2B via webhooks quando o status de um pedido muda. A transação de mudança de status (`changeStatus` em `src/modules/orders/order.service.ts`) já é pesada: atualiza a tabela `orders`, insere um registro em `order_status_history` e, dependendo da transição, decrementa ou incrementa `stock_quantity` dos produtos via `debitStock`/`replenishStock`. Tudo isso ocorre dentro de uma única transação Prisma (`this.prisma.$transaction`).
 
-Realizar chamadas HTTP de forma síncrona dentro dessa transação traria dois problemas graves:
-
-1. **Bloqueio da transação** — se o cliente consumidor do webhook estiver lento, a mudança de status ficaria travada aguardando resposta HTTP.
-2. **Impossibilidade de rollback consistente** — se o cliente estiver fora do ar após o commit da transação, não há como reverter a mudança de status; e se a chamada HTTP falhar antes do commit, a transação inteira seria revertida sem necessidade.
-
-A equipe é pequena e a infraestrutura atual já conta com MySQL gerenciado via Prisma (`prisma/schema.prisma`). Adicionar componentes extras de infraestrutura aumentaria a complexidade operacional de forma desproporcional.
+O problema central é: como registrar o evento de webhook de forma que seja atomicamente consistente com a mudança de status, sem degradar a latência nem acoplar a disponibilidade do sistema à disponibilidade dos endpoints dos clientes?
 
 ## Decisão
 
-Adotar o padrão **Transactional Outbox** utilizando o MySQL existente.
+Adotar o **padrão Transactional Outbox** utilizando o MySQL existente do projeto. Dentro da mesma transação SQL que já atualiza `orders`, insere em `order_status_history` e manipula estoque, será inserida uma linha em uma nova tabela `webhook_outbox` contendo o evento a ser despachado.
 
-Uma tabela `webhook_outbox` será criada com as seguintes características:
+O payload do evento será renderizado como snapshot no momento da inserção (não será montado posteriormente a partir do `order_id`), garantindo que o evento reflita o estado exato do pedido no instante da transição de status.
 
-- Chave primária UUID (`@default(uuid()) @db.Char(36)`), seguindo o padrão do projeto definido em `prisma/schema.prisma`.
-- Coluna `status` com valores possíveis: `pending`, `processing`, `failed`, `delivered`.
-- Índice composto em `(status, created_at)` para leitura eficiente pelo worker.
-- A inserção na `webhook_outbox` ocorre **dentro da mesma transação** que atualiza `orders` e insere em `order_status_history` no método `changeStatus` (`src/modules/orders/order.service.ts`).
+Os identificadores da tabela outbox seguirão o padrão UUID já estabelecido no projeto, conforme confirmado na reunião ([09:51]).
 
-Um worker separado lê registros com status `pending` em pequenos lotes, realiza o dispatch HTTP e atualiza o status do registro para `delivered` ou `failed`.
+A filtragem de eventos ocorrerá no momento da inserção na outbox: se nenhum webhook configurado para o `customer_id` em questão deseja receber notificação para aquele status específico, a linha não será inserida na outbox ([09:34]).
 
-Garantia de consistência: se a transação do `changeStatus` fizer commit, o evento está gravado; se fizer rollback, o evento desaparece junto. Não há janela de inconsistência.
+### Ponto de integração no código existente
+
+O método `changeStatus` em `src/modules/orders/order.service.ts` (linhas 126-179) receberá uma chamada adicional dentro do bloco `this.prisma.$transaction(async (tx) => { ... })`, após a inserção no histórico e antes do retorno. Essa chamada inserirá o evento na outbox utilizando o mesmo `tx` (transaction client) da transação corrente, garantindo atomicidade.
 
 ## Alternativas Consideradas
 
-### 1. Dispatch síncrono no order service
+### 1. Despacho síncrono dentro do service de orders
 
-Chamada HTTP direta dentro de `changeStatus`. Descartada porque bloquearia a transação e impossibilitaria rollback coerente em caso de falha do consumidor.
+Disparar a chamada HTTP ao endpoint do cliente diretamente dentro do método `changeStatus`, na mesma requisição.
 
-### 2. Redis Streams
+**Rejeitada porque:**
+- Um cliente com endpoint lento travaria a transação de mudança de status, impactando todos os demais pedidos ([09:04] Bruno).
+- Se o endpoint do cliente estivesse fora do ar, seria necessário decidir entre dar rollback na mudança de status (inaceitável) ou perder o evento (inconsistente) ([09:04] Bruno).
+- Acoplaria a disponibilidade do sistema à disponibilidade de sistemas externos.
 
-Publicar evento em um stream Redis após o commit. Oferece baixa latência e backpressure nativo, porém:
+### 2. Fila externa (Redis Streams ou similar)
 
-- Exige infraestrutura adicional (Redis Cluster para alta disponibilidade).
-- Introduz risco de inconsistência: o commit SQL pode ocorrer e a publicação no Redis falhar (ou vice-versa), já que são dois sistemas de armazenamento distintos sem transação distribuída.
-- Considerada overengineering para o tamanho atual da equipe.
+Utilizar Redis Streams, RabbitMQ ou outro broker de mensagens para intermediar os eventos.
+
+**Rejeitada porque:**
+- Exigiria subir e manter infraestrutura adicional (Redis Cluster ou broker), o que é desproporcional para o tamanho do time ([09:07] Diego).
+- Introduziria complexidade operacional sem benefício proporcional, dado que o MySQL existente já atende ao requisito.
+- O padrão outbox no banco relacional existente oferece a mesma garantia de consistência transacional com menor custo operacional.
 
 ## Consequências
 
 ### Positivas
 
-- **Consistência garantida** — evento e estado do pedido compartilham a mesma transação ACID.
-- **Zero infraestrutura adicional** — reutiliza o MySQL já existente.
-- **Simplicidade operacional** — equipe pequena consegue manter e monitorar com ferramentas que já conhece.
-- **Resiliência** — falhas de rede ou indisponibilidade do consumidor não afetam a operação de mudança de status.
+- **Consistência transacional garantida:** se a mudança de status sofrer rollback, o evento da outbox é descartado junto; se commitou, o evento está persistido. Não há janela de inconsistência.
+- **Nenhuma infraestrutura adicional:** reutiliza o MySQL e o Prisma Client já presentes no projeto (`prisma/schema.prisma`, `src/config/database.ts`).
+- **Desacoplamento temporal:** o despacho HTTP acontece de forma assíncrona pelo worker, sem impactar a latência da API.
 
 ### Negativas
 
-- **Polling** — o worker precisa consultar a tabela periodicamente; latência de entrega depende do intervalo de polling.
-- **Carga no banco** — em cenários de altíssimo volume, a tabela `webhook_outbox` pode crescer e exigir estratégia de expurgo (delete de registros `delivered` antigos).
-- **Acoplamento ao MySQL** — se no futuro o time migrar para outro banco, o mecanismo de outbox precisará ser adaptado.
+- **Carga adicional no MySQL:** cada mudança de status que tenha webhooks configurados gera uma escrita extra na tabela outbox dentro da mesma transação. Em cenários de pico, isso aumenta a contenção no banco.
+- **Necessidade de manutenção da tabela outbox:** linhas processadas acumulam na tabela e precisam de uma estratégia de arquivamento ou limpeza periódica (mencionado como fora de escopo desta feature, com sugestão de 30 dias - [09:08] Diego).
+
+### Trade-off explícito
+
+Aceita-se uma carga adicional no banco de dados relacional em troca de eliminar a necessidade de infraestrutura externa e garantir consistência transacional forte entre a mudança de status e o registro do evento.

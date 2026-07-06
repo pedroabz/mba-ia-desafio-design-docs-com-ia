@@ -1,55 +1,79 @@
-# ADR-003: Autenticação de entregas de webhook com HMAC-SHA256 e secret por endpoint
+# ADR-003: Autenticação HMAC-SHA256 com secret por endpoint
 
-## Status
+**Status:** Aceita
+**Data:** 2026-07-05
+**Decisores:** Sofia (Engenheira de Segurança), Bruno (Engenheiro Pleno), Diego (Engenheiro Sênior)
 
-Aceita
+---
 
 ## Contexto
 
-O sistema expõe eventos contendo dados de pedidos para endpoints externos fora da nossa infraestrutura. O cliente consumidor precisa garantir duas propriedades ao receber uma requisição:
+O sistema de webhooks envia dados de pedidos (status, valores, identificadores) para endpoints externos controlados pelos clientes B2B. É necessário que o cliente consiga verificar duas propriedades de cada requisição recebida:
 
-1. **Autenticidade** — a requisição realmente partiu da nossa plataforma e não de um terceiro mal-intencionado.
-2. **Integridade** — o payload não foi adulterado em trânsito.
+1. **Autenticidade:** a requisição foi realmente originada pelo nosso sistema.
+2. **Integridade:** o payload não foi adulterado em trânsito.
 
-Além disso, houve incidentes anteriores em que um cliente vazou a secret em logs de aplicação. Isso evidencia a necessidade de isolar o impacto de um vazamento ao menor escopo possível, evitando que uma única secret comprometida exponha todos os endpoints da plataforma.
+Além disso, caso uma secret seja comprometida (situação já observada anteriormente quando um cliente vazou a secret em logs de aplicação - [09:22] Diego), o impacto deve ser limitado e a recuperação deve ser simples.
 
 ## Decisão
 
-Adotar **HMAC-SHA256** como mecanismo de autenticação para todas as entregas de webhook, com as seguintes regras:
+Adotar **HMAC-SHA256** como mecanismo de assinatura dos payloads de webhook, com as seguintes características:
 
-1. **Assinatura sobre o body** — o worker de dispatch calcula `HMAC-SHA256(secret, request_body)` e envia o resultado no header `X-Signature`. O cliente recalcula o HMAC no seu lado e compara com o valor recebido.
+### Assinatura
 
-2. **Secret única por endpoint** — cada registro de webhook na tabela de configuração armazena `url`, `secret`, `customer_id` e `active`. Não existe secret global da plataforma. Se uma secret vazar, apenas aquele endpoint específico fica comprometido.
+- O corpo (body) de cada requisição HTTP será assinado com HMAC-SHA256 usando a secret do endpoint.
+- A assinatura será enviada no header `X-Signature`.
+- O cliente valida a assinatura do lado dele recalculando o HMAC sobre o body recebido com a secret compartilhada.
 
-3. **Rotação com grace period de 24 horas** — o cliente pode solicitar uma nova secret via API. Ao rotacionar, a secret anterior permanece válida em paralelo por 24 horas, permitindo que o cliente migre sem perder entregas. Após esse período, a secret antiga é invalidada automaticamente.
+### Secret por endpoint
 
-4. **TLS obrigatório** — a URL do webhook deve utilizar HTTPS. Tentativas de cadastrar URLs com esquema HTTP são rejeitadas com erro de validação no momento do registro.
+- Cada endpoint de webhook configurado terá uma **secret única**, associada ao registro de configuração (url + secret + customer_id + estado ativo).
+- Não haverá secret global da plataforma. Se uma secret vazar, somente aquele endpoint específico é comprometido ([09:21] Sofia).
+
+### Rotação de secrets
+
+- O cliente poderá solicitar a rotação da secret via API.
+- Ao rotacionar, a secret anterior permanecerá válida por um **grace period de 24 horas**, permitindo que o cliente migre seus sistemas.
+- Após 24 horas, a secret antiga será invalidada automaticamente.
+- Durante o grace period, o sistema assinará com a secret nova, mas o cliente poderá validar com qualquer uma das duas.
+
+### TLS obrigatório
+
+- A URL do webhook deverá obrigatoriamente usar HTTPS. URLs com esquema HTTP serão rejeitadas com erro de validação no momento do cadastro ([09:23] Sofia).
 
 ## Alternativas Consideradas
 
-### 1. Secret global única para toda a plataforma
+### 1. Secret global da plataforma
 
-Uma única secret compartilhada entre todos os endpoints cadastrados. Descartada porque o vazamento de uma única chave comprometeria **todos** os clientes simultaneamente, tornando o raio de impacto inaceitável. O incidente anterior de vazamento em log de aplicação reforça esse risco.
+Uma única secret compartilhada entre todos os endpoints de todos os clientes.
+
+**Rejeitada porque:**
+- O vazamento de uma única secret comprometeria todos os clientes simultaneamente ([09:21] Sofia).
+- Não permite rotação granular: rotacionar a secret global exigiria que todos os clientes atualizassem seus sistemas ao mesmo tempo.
 
 ### 2. JWT assinado por request
 
-Gerar um token JWT para cada entrega, assinado com chave privada da plataforma, permitindo que o cliente valide com a chave pública. Descartada porque:
+Gerar um JWT para cada requisição de webhook, contendo claims com os dados do evento.
 
-- Adiciona complexidade desnecessária (gerenciamento de par de chaves, distribuição de chave pública, parsing de claims).
-- Não oferece vantagem prática para o cenário de webhook outbound, onde o cliente já possui uma secret compartilhada e precisa apenas validar autenticidade e integridade.
-- HMAC-SHA256 é o padrão de mercado para webhooks (adotado por Stripe, GitHub, Shopify) e toda linguagem relevante possui bibliotecas maduras para verificação.
+**Rejeitada porque:**
+- Adiciona complexidade desnecessária: o JWT carrega overhead de encoding (header, payload, signature) quando o único objetivo é validar autenticidade e integridade do body.
+- HMAC-SHA256 é o padrão de mercado para webhooks (Stripe, GitHub, Shopify) e todas as bibliotecas de clientes já suportam nativamente ([09:20] Sofia).
+- O JWT exigiria que o cliente também validasse claims de expiração e audience, adicionando lógica que não agrega valor neste caso de uso.
 
 ## Consequências
 
 ### Positivas
 
-- **Isolamento de impacto** — vazamento de uma secret compromete apenas um endpoint, não a plataforma inteira.
-- **Padrão de mercado** — clientes já possuem familiaridade e bibliotecas prontas para verificar HMAC-SHA256, reduzindo atrito de integração.
-- **Rotação sem downtime** — o grace period de 24 horas garante que o cliente pode migrar para a nova secret sem perder entregas durante a transição.
-- **Proteção contra man-in-the-middle** — TLS obrigatório protege o payload em trânsito; HMAC garante que mesmo em cenário de TLS comprometido, adulteração é detectável.
+- **Padrão de mercado:** HMAC-SHA256 é amplamente adotado em webhooks, facilitando a integração por parte dos clientes que já possuem bibliotecas para essa validação.
+- **Isolamento de comprometimento:** o vazamento de uma secret afeta apenas um endpoint específico de um cliente.
+- **Rotação sem downtime:** o grace period de 24 horas permite que o cliente migre sem perder eventos durante a transição.
+- **Simplicidade:** a implementação é direta tanto no lado do servidor (assinar) quanto no lado do cliente (verificar).
 
 ### Negativas
 
-- **Complexidade de rotação** — o sistema precisa manter até duas secrets válidas simultaneamente por endpoint durante o grace period, exigindo lógica adicional no worker de dispatch (tentar validar com ambas as secrets) e um job para expirar secrets antigas após 24 horas.
-- **Armazenamento seguro de secrets** — cada endpoint armazena uma secret sensível no banco de dados. É necessário garantir criptografia at-rest e controle de acesso rigoroso à tabela de configuração de webhooks.
-- **Responsabilidade do cliente** — a segurança depende de o cliente implementar corretamente a verificação do HMAC e proteger a secret no seu ambiente. Não há como a plataforma impedir mau uso no lado do consumidor.
+- **Armazenamento de duas secrets durante rotação:** durante o grace period, o sistema precisa manter e gerenciar duas secrets ativas por endpoint, adicionando complexidade ao modelo de dados e à lógica de assinatura.
+- **Responsabilidade do cliente:** o cliente é responsável por implementar a verificação do HMAC corretamente. Se ele ignorar a validação, a segurança do lado dele não está garantida.
+
+### Trade-off explícito
+
+Aceita-se a complexidade de gerenciar secrets individuais por endpoint e o mecanismo de grace period em troca de isolamento de segurança granular e aderência ao padrão de mercado.

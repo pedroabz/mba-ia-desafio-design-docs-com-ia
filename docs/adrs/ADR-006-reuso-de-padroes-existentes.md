@@ -1,56 +1,78 @@
-# ADR-006: Reusar padrões existentes do projeto para o módulo de webhooks
+# ADR-006: Reuso dos padrões existentes do projeto
 
-## Status
+**Status:** Aceita
+**Data:** 2026-07-05
+**Decisores:** Bruno (Engenheiro Pleno), Larissa (Tech Lead)
 
-Aceita
+---
 
 ## Contexto
 
-O projeto já possui convenções bem definidas e aplicadas em todos os módulos existentes. O domínio de pedidos (`src/modules/orders/`) estabelece um padrão claro: cada módulo contém controller, service, repository, routes e schemas dentro de sua própria pasta em `src/modules/`. Além disso, a codebase conta com infraestrutura transversal madura:
+O projeto possui padrões de código bem estabelecidos e consistentes entre os módulos existentes (`auth`, `users`, `customers`, `products`, `orders`). Ao introduzir o módulo de webhooks, é necessário decidir se ele seguirá os mesmos padrões ou adotará abordagens diferentes.
 
-- **Erros**: classe base `AppError` em `src/shared/errors/app-error.ts` com `statusCode`, `errorCode` e `details`; erros HTTP especializados em `src/shared/errors/http-errors.ts` (`NotFoundError`, `ConflictError`, etc.); códigos de erro padronizados como `INSUFFICIENT_STOCK` e `INVALID_STATUS_TRANSITION`.
-- **Logger**: Pino configurado em `src/shared/logger/index.ts` com redact de campos sensíveis e nome de serviço base, utilizado em toda a aplicação.
-- **Middleware de erros**: `src/middlewares/error.middleware.ts` trata de forma centralizada `AppError`, `ZodError` e `PrismaClientKnownRequestError`.
-- **Middleware de autenticação**: `src/middlewares/auth.middleware.ts` com `authenticate` e `requireRole('ADMIN')`.
-- **Schemas**: validação com Zod seguindo convenção de nomeação e estrutura dos módulos existentes.
+Os padrões existentes incluem:
 
-A funcionalidade de webhooks precisa de controller, service, repository, rotas, schemas de validação, códigos de erro e logging — exatamente os mesmos building blocks que já existem. A questão é se devemos reusar esses padrões ou criar algo separado.
+- **Estrutura de módulos:** cada domínio em `src/modules/<domínio>/` com `controller`, `service`, `repository`, `routes` e `schemas`.
+- **Tratamento de erros:** classe base `AppError` (`src/shared/errors/app-error.ts`) com `statusCode`, `errorCode` e `details`; classes especializadas como `NotFoundError`, `ConflictError`, `InvalidStatusTransitionError`, `InsufficientStockError` (`src/shared/errors/http-errors.ts`); middleware centralizado que trata `AppError`, `ZodError` e `PrismaClientKnownRequestError` (`src/middlewares/error.middleware.ts`).
+- **Códigos de erro:** convenção de prefixo por domínio em upper snake case (exemplos: `INSUFFICIENT_STOCK`, `INVALID_STATUS_TRANSITION`, `INACTIVE_PRODUCT`).
+- **Autenticação e autorização:** middleware `authenticate` e função `requireRole` (`src/middlewares/auth.middleware.ts`) com suporte a roles `ADMIN` e `OPERATOR`.
+- **Logging:** Pino com redação automática de campos sensíveis (`authorization`, `password`, `token`) e transporte pretty para desenvolvimento (`src/shared/logger/index.ts`).
+- **Validação:** schemas Zod para validação de entrada.
+- **IDs:** UUID v4 para todas as entidades (`@default(uuid())` em `prisma/schema.prisma`).
 
 ## Decisão
 
-Máximo reuso do que já existe. O módulo de webhooks será estruturado como qualquer outro módulo do projeto:
+O módulo de webhooks **reutilizará integralmente os padrões existentes** do projeto, sem introduzir frameworks, bibliotecas ou convenções novas.
 
-- **Estrutura de pasta**: `src/modules/webhooks/` contendo `webhook.controller.ts`, `webhook.service.ts`, `webhook.repository.ts`, `webhook.routes.ts` e `webhook.schemas.ts`.
-- **Worker**: entry point em `src/worker.ts`, lógica de processamento em `src/modules/webhooks/webhook.processor.ts`.
-- **Erros**: classes estendendo `AppError` com códigos prefixados por `WEBHOOK_` — por exemplo `WEBHOOK_NOT_FOUND`, `WEBHOOK_INVALID_URL`, `WEBHOOK_SECRET_REQUIRED`. O middleware de erros em `src/middlewares/error.middleware.ts` captura automaticamente sem necessidade de alteração.
-- **Logger**: Pino já configurado em `src/shared/logger/index.ts`, utilizado diretamente sem adicionar dependência nova.
-- **Schemas**: validação via Zod seguindo o mesmo padrão dos módulos existentes.
-- **Autenticação**: rotas administrativas protegidas por `authenticate` e `requireRole('ADMIN')` de `src/middlewares/auth.middleware.ts`.
+### Estrutura do módulo
 
-Nenhuma biblioteca, framework ou padrão arquitetural novo será introduzido para este módulo.
+- O módulo será criado em `src/modules/webhooks/` seguindo a mesma organização dos demais módulos (controller, service, repository, routes, schemas).
+
+### Tratamento de erros
+
+- Erros específicos do módulo serão classes que estendem `AppError` ou suas subclasses (`NotFoundError`, `ConflictError`, etc.), seguindo o padrão já estabelecido.
+- Os códigos de erro utilizarão o prefixo `WEBHOOK_` (exemplos: `WEBHOOK_NOT_FOUND`, `WEBHOOK_INVALID_URL`, `WEBHOOK_SECRET_REQUIRED`) ([09:28-09:29] Bruno, Larissa).
+- O middleware de erro centralizado (`src/middlewares/error.middleware.ts`) já trata qualquer instância de `AppError` sem necessidade de alteração.
+
+### Autenticação e autorização
+
+- Endpoints CRUD de configuração de webhook utilizarão o middleware `authenticate` existente.
+- O endpoint de replay de DLQ exigirá role `ADMIN` via `requireRole('ADMIN')` já disponível ([09:36] Larissa, Sofia).
+
+### Logging
+
+- O logger Pino existente (`src/shared/logger/index.ts`) será utilizado em todo o módulo, incluindo o worker. A secret do webhook deverá ser adicionada aos paths de redação do Pino para evitar vazamento em logs.
+
+### Validação
+
+- Schemas Zod para validação de entrada nos endpoints do módulo, conforme padrão dos demais módulos.
 
 ## Alternativas Consideradas
 
-### 1. Criar framework/estrutura separada para webhooks
+### 1. Introduzir framework ou biblioteca nova para o módulo de webhooks
 
-Criar uma camada ou mini-framework dedicado para webhooks com suas próprias convenções de roteamento, tratamento de erro e logging. Descartada porque fragmentaria a codebase, exigiria que a equipe mantivesse dois conjuntos de convenções em paralelo e aumentaria a carga cognitiva sem ganho proporcional.
+Adotar uma biblioteca especializada em webhooks ou um framework diferente para o worker.
 
-### 2. Usar biblioteca externa de webhooks
-
-Adotar uma biblioteca de mercado (ex: `standardwebhooks`, `svix`) para gerenciamento de webhooks. Descartada porque adicionaria uma dependência desnecessária, não se integraria naturalmente com os padrões existentes de `AppError`, Pino e middleware centralizado, e introduziria abstrações que a equipe precisaria aprender sem necessidade — já que os building blocks internos atendem todos os requisitos.
+**Rejeitada porque:**
+- Introduziria inconsistência na codebase, obrigando desenvolvedores a conhecer dois conjuntos de convenções.
+- Os padrões existentes atendem todos os requisitos do módulo de webhooks sem lacunas identificadas.
+- Aumentaria a superfície de dependências e a carga de manutenção.
+- A equipe já domina os padrões atuais, reduzindo o tempo de desenvolvimento ([09:29] Bruno).
 
 ## Consequências
 
 ### Positivas
 
-- **Curva de aprendizado zero** — qualquer desenvolvedor que já trabalhou em outro módulo do projeto entende imediatamente a estrutura de webhooks.
-- **Consistência da codebase** — mesma convenção de nomeação, mesma organização de pastas, mesmos padrões de erro em toda a aplicação.
-- **Middleware reutilizado sem alteração** — o error middleware em `src/middlewares/error.middleware.ts` captura erros de webhook automaticamente por serem instâncias de `AppError`.
-- **Menos dependências** — nenhum pacote externo novo, reduzindo superfície de vulnerabilidade e complexidade de manutenção.
-- **Logging uniforme** — Pino com a mesma configuração de redact e formato, facilitando observabilidade e busca centralizada de logs.
+- **Consistência da codebase:** qualquer desenvolvedor que conheça um módulo existente será capaz de navegar e contribuir no módulo de webhooks sem curva de aprendizado adicional.
+- **Reutilização do middleware de erro:** erros do módulo de webhooks serão automaticamente tratados e formatados pelo middleware centralizado, sem necessidade de código adicional.
+- **Reutilização do sistema de autorização:** o controle de acesso ao endpoint de replay de DLQ (role `ADMIN`) é implementado com uma única chamada a `requireRole`, já existente e testada.
+- **Logging uniforme:** o worker e a API usam o mesmo formato de log, facilitando correlação de eventos em ferramentas de observabilidade.
 
 ### Negativas
 
-- **Acoplamento ao padrão atual** — se no futuro o time decidir migrar a arquitetura dos módulos (ex: para hexagonal ou CQRS), o módulo de webhooks precisará ser refatorado junto com os demais.
-- **Sem otimizações específicas de webhook** — bibliotecas dedicadas podem oferecer funcionalidades prontas (fan-out, rate limiting por subscriber, dashboard de monitoramento) que precisariam ser implementadas manualmente caso se tornem requisitos futuros.
-- **Rigidez de nomenclatura** — o prefixo `WEBHOOK_` nos códigos de erro e seguir exatamente a mesma estrutura de pastas pode parecer restritivo se o módulo crescer em complexidade, porém mantém a previsibilidade.
+- **Acoplamento aos padrões atuais:** se os padrões existentes tiverem limitações que só se manifestem no contexto de webhooks (por exemplo, necessidade de logs estruturados específicos do worker), será necessário adaptá-los, potencialmente impactando outros módulos.
+- **Dependência do PrismaClient por processo:** o worker precisa instanciar seu próprio `PrismaClient` (mesmo banco, instância separada), o que é uma consequência natural do modelo de processo separado (ADR-005), mas exige atenção para não reutilizar a instância singleton de `src/config/database.ts`.
+
+### Trade-off explícito
+
+Aceita-se o acoplamento aos padrões existentes em troca de consistência total na codebase, menor curva de aprendizado e reutilização de infraestrutura já testada e funcional.

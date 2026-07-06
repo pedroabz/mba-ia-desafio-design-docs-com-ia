@@ -1,60 +1,68 @@
-# ADR-004: Garantia de entrega at-least-once com X-Event-Id para deduplicação client-side
+# ADR-004: Garantia at-least-once com X-Event-Id
 
-## Status
+**Status:** Aceita
+**Data:** 2026-07-05
+**Decisores:** Diego (Engenheiro Sênior), Sofia (Engenheira de Segurança), Marcos (Product Manager)
 
-Aceita
+---
 
 ## Contexto
 
-O sistema de webhooks precisa definir qual garantia de entrega oferece aos clientes consumidores. As três opções clássicas são: at-most-once (pode perder eventos), at-least-once (pode duplicar eventos) e exactly-once (nunca perde nem duplica).
+O sistema de webhooks precisa definir qual garantia de entrega oferece aos clientes: o evento pode ser entregue zero vezes (best-effort), exatamente uma vez (exactly-once) ou pelo menos uma vez (at-least-once). Essa definição impacta diretamente a complexidade da implementação e as responsabilidades do cliente na integração.
 
-O mecanismo de retry com backoff exponencial (ADR-002) implica que um mesmo evento pode ser entregue mais de uma vez — por exemplo, quando o servidor do cliente recebe o payload e processa com sucesso, mas a resposta HTTP se perde na rede antes de chegar ao nosso worker. Nesse cenário, o worker interpreta como falha e reenvia.
-
-Para que o cliente consiga identificar duplicatas, é necessário fornecer um identificador único e estável por evento. O projeto já utiliza UUID como padrão de identificação (`@default(uuid()) @db.Char(36)` em `prisma/schema.prisma`), o que torna natural gerar um UUID no momento em que o evento é inserido na tabela `webhook_outbox`.
+Com o padrão outbox e o mecanismo de retry (ADR-001 e ADR-002), existe a possibilidade real de que o mesmo evento seja entregue mais de uma vez. Por exemplo: o worker envia o evento, o endpoint do cliente processa com sucesso mas a resposta HTTP se perde por timeout de rede. O worker, sem receber confirmação, retenta o envio.
 
 ## Decisão
 
-Adotar garantia de entrega **at-least-once** com header `X-Event-Id` para deduplicação no lado do cliente.
+Adotar **garantia at-least-once** com mecanismo de deduplicação baseado em **X-Event-Id**.
 
-Funcionamento:
+### Mecanismo
 
-1. Quando um evento é inserido na `webhook_outbox` (dentro da transação do `changeStatus`), um UUID é gerado como chave primária do registro. Esse UUID é o **event_id**.
-2. Em toda requisição HTTP de dispatch do webhook, o header `X-Event-Id` é incluído com o valor do UUID do evento.
-3. Se o mesmo evento for entregue mais de uma vez (por conta de retry), o valor de `X-Event-Id` será idêntico em todas as tentativas.
-4. O cliente é responsável por armazenar os `event_id` já processados e ignorar duplicatas.
+- Cada evento inserido na tabela outbox receberá um **UUID único** (`event_id`), gerado no momento da inserção.
+- Esse UUID será enviado no header **`X-Event-Id`** de cada requisição HTTP ao endpoint do cliente.
+- Em caso de retry, o mesmo `event_id` será reenviado, permitindo que o cliente identifique duplicatas.
+- A **responsabilidade de deduplicação é do cliente**: ele deve armazenar os `event_id` recebidos e ignorar eventos já processados.
 
-A responsabilidade de deduplicação fica no cliente. Esse modelo é padrão de mercado — adotado por Stripe, GitHub Webhooks e outros provedores de larga escala.
+### Headers enviados
+
+Além do `X-Event-Id`, cada requisição de webhook incluirá:
+- `X-Signature` (HMAC-SHA256, conforme ADR-003)
+- `X-Timestamp` (timestamp do envio, para detecção de replay attack)
+- `X-Webhook-Id` (identificador do endpoint de webhook configurado)
+- `Content-Type: application/json`
 
 ## Alternativas Consideradas
 
-### 1. Exactly-once delivery — coordenação bidirecional
+### 1. Garantia exactly-once
 
-Garantir entrega exatamente uma vez exigiria um protocolo de two-phase commit ou confirmação explícita entre nosso sistema e o cliente (ex.: o cliente confirma via callback que processou o evento, e só então marcamos como entregue). Descartada porque:
+Garantir que cada evento seja entregue exatamente uma vez, sem duplicatas.
 
-- Aumenta drasticamente a complexidade de implementação em ambos os lados.
-- Exige que todos os clientes implementem o protocolo de confirmação, elevando a barreira de integração.
-- Falhas parciais no protocolo de coordenação podem gerar estados inconsistentes difíceis de resolver.
-- A equipe é pequena e o benefício marginal sobre at-least-once com deduplicação não justifica o custo.
+**Rejeitada porque:**
+- Exigiria coordenação bidirecional entre o nosso sistema e o sistema do cliente (por exemplo, protocolo de confirmação em duas fases ou idempotency keys com verificação pré-envio).
+- A complexidade de implementação e operacional é desproporcionalmente alta para o benefício ([09:25] Diego).
+- Nenhum sistema de webhooks de referência no mercado oferece exactly-once: Stripe, GitHub e outros adotam at-least-once com event_id ([09:25] Diego).
 
 ### 2. Sem mecanismo de deduplicação
 
-Entregar at-least-once sem fornecer um identificador estável ao cliente. Mais simples de implementar (nenhum header adicional), porém:
+Oferecer at-least-once sem enviar identificador único, deixando o cliente sem meio de detectar duplicatas.
 
-- Clientes não teriam como diferenciar um evento novo de uma reentrega, tornando impossível a deduplicação no lado deles.
-- Poderia causar efeitos colaterais indesejados (ex.: cobrar um cliente duas vezes, enviar e-mail duplicado).
-- Transfere todo o risco de duplicata para o cliente sem oferecer ferramenta para mitigá-lo.
+**Rejeitada porque:**
+- O cliente não teria como diferenciar uma entrega original de um retry, podendo processar o mesmo evento múltiplas vezes com efeitos colaterais indesejados (por exemplo, enviar email duplicado ao consumidor final).
+- Transferir responsabilidade de deduplicação sem fornecer ferramenta para tal é uma integração frágil.
 
 ## Consequências
 
 ### Positivas
 
-- **Simplicidade de implementação** — reusa o UUID já gerado como PK da `webhook_outbox`; basta incluir o header no dispatch HTTP.
-- **Padrão de mercado** — clientes familiarizados com Stripe/GitHub já conhecem o modelo e sabem implementar deduplicação.
-- **Resiliência** — o sistema pode reenviar livremente sem risco de causar side-effects no cliente, desde que o cliente implemente dedup.
-- **Baixo acoplamento** — não exige protocolo de coordenação bidirecional; o contrato é unidirecional (nosso sistema envia, cliente deduplica).
+- **Simplicidade de implementação:** o servidor apenas garante persistência e retry, sem necessidade de coordenação complexa com o cliente.
+- **Padrão reconhecido:** clientes que já integram com Stripe, GitHub ou similares já possuem lógica de deduplicação por event_id, reduzindo a curva de integração.
+- **Resiliência:** nenhum evento é perdido silenciosamente; na pior das hipóteses, o cliente recebe duplicatas que pode identificar e ignorar.
 
 ### Negativas
 
-- **Responsabilidade no cliente** — clientes que não implementarem deduplicação por `X-Event-Id` podem sofrer processamento duplicado. Essa responsabilidade deve ser documentada de forma proeminente no portal do desenvolvedor.
-- **Armazenamento no cliente** — o cliente precisa manter um registro de `event_id` já processados, o que consome armazenamento e exige estratégia de expurgo.
-- **Não elimina duplicatas** — o sistema conscientemente aceita que duplicatas ocorrerão; apenas fornece o mecanismo para o cliente tratá-las.
+- **Responsabilidade transferida ao cliente:** o cliente precisa implementar deduplicação do lado dele. Se não o fizer, pode processar eventos duplicados. Marcos se comprometeu a documentar isso de forma destacada no portal de desenvolvedor ([09:26]).
+- **Possibilidade de duplicatas:** em cenários de falha de rede ou timeout, o cliente pode receber o mesmo evento mais de uma vez, o que exige que seus sistemas sejam preparados para isso.
+
+### Trade-off explícito
+
+Aceita-se transferir a responsabilidade de deduplicação para o cliente em troca de simplicidade de implementação no servidor e aderência ao padrão consolidado de mercado para sistemas de webhooks.
